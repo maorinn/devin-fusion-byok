@@ -3,6 +3,8 @@
 // Anthropic Messages API support. Requests are translated from the neutral
 // Devin request shape; streamed events are adapted into Chat Completions-style
 // chunks so the shared processor and monitor handle them unchanged.
+const { replayScope, replayReader } = require('./reasoning-replay.cjs');
+
 const ANTHROPIC_VERSION = '2023-06-01';
 const MAX_OUTPUT_TOKENS = 128000;
 const DEFAULT_OUTPUT_TOKENS = 64000;
@@ -31,9 +33,28 @@ function toolInput(args) {
   } catch { return {}; }
 }
 
-function buildAnthropicBody(request, route, provider) {
+const CACHE = Object.freeze({ type: 'ephemeral' });
+const UNCACHEABLE = new Set(['thinking', 'redacted_thinking']);
+
+// Prompt caching: one breakpoint after the tools, one after the system prompt
+// and one on the newest message. Anthropic looks back up to 20 blocks from
+// each breakpoint, so the previous turn's prefix is still found.
+function withCacheBreakpoints(body) {
+  const tools = body.tools?.map((tool, index, all) => index === all.length - 1 ? { ...tool, cache_control: CACHE } : tool);
+  const system = typeof body.system === 'string' && body.system ? [{ type: 'text', text: body.system, cache_control: CACHE }] : body.system;
+  const messages = body.messages.map((message, index, all) => {
+    if (index !== all.length - 1) return message;
+    const target = message.content.findLastIndex(block => !UNCACHEABLE.has(block.type) && !(block.type === 'text' && !block.text));
+    if (target < 0) return message;
+    return { ...message, content: message.content.map((block, i) => i === target ? { ...block, cache_control: CACHE } : block) };
+  });
+  return { ...body, messages, ...(system !== undefined ? { system } : {}), ...(tools ? { tools } : {}) };
+}
+
+function buildAnthropicBody(request, route, provider, { replay, scope = replayScope(provider, route) } = {}) {
   const system = request.systemPrompt ? [request.systemPrompt] : [];
   const messages = [];
+  const replayed = replayReader(provider.replayReasoning === false ? undefined : replay, scope);
   const push = (role, blocks) => {
     if (!blocks.length) return;
     const last = messages.at(-1);
@@ -49,7 +70,7 @@ function buildAnthropicBody(request, route, provider) {
       if (!messages.length) { if (message.content) system.push(message.content); }
       else push('user', message.content ? [{ type: 'text', text: message.content }] : []);
     } else if (message.role === 'assistant') {
-      push('assistant', [...textBlocks(message),
+      push('assistant', [...replayed(message.toolCalls?.map(tool => tool.id)), ...textBlocks(message),
         ...(message.toolCalls || []).map(tool => ({ type: 'tool_use', id: tool.id, name: tool.name, input: toolInput(tool.arguments) }))]);
     } else {
       push('user', textBlocks(message));
@@ -70,7 +91,7 @@ function buildAnthropicBody(request, route, provider) {
     if (type === 'none') body.tool_choice = { type: 'none' };
     else if (choice) body.tool_choice = { type: 'auto' };
   }
-  return body;
+  return provider.promptCache === false ? body : withCacheBreakpoints(body);
 }
 
 const FINISH = { max_tokens: 'length', model_context_window_exceeded: 'length', refusal: 'content_filter' };

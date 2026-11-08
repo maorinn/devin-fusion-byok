@@ -64,7 +64,7 @@ async function run(t, events, route = { model: 'claude-opus-5-5', uid: 'local-cl
 
 test('Anthropic request body maps system, images, tool calls, merged tool results and tool choice', () => {
   const body = buildRequestBody(parseChat(nativeRequest()), { model: 'claude-opus-5-5', effort: 'xhigh', maxOutputTokens: 131072 }, { apiFormat: 'anthropic' });
-  assert.equal(body.system, 'System prompt');
+  assert.deepEqual(body.system, [{ type: 'text', text: 'System prompt', cache_control: { type: 'ephemeral' } }]);
   assert.equal(body.max_tokens, 128000);
   assert.deepEqual(body.output_config, { effort: 'xhigh' });
   assert.equal(body.stream, true);
@@ -78,7 +78,7 @@ test('Anthropic request body maps system, images, tool calls, merged tool result
     { type: 'tool_result', tool_use_id: 'call_a', content: 'first result' },
     { type: 'tool_result', tool_use_id: 'call_b', content: 'second result', is_error: true }]);
   assert.deepEqual(next.slice(2).map(block => block.text), ['System message in the middle', 'User after tool']);
-  assert.deepEqual(body.tools, [{ name: 'shell_command', description: 'Run a command', input_schema: { type: 'object', properties: { cmd: { type: 'string' } } } }]);
+  assert.deepEqual(body.tools, [{ name: 'shell_command', description: 'Run a command', input_schema: { type: 'object', properties: { cmd: { type: 'string' } } }, cache_control: { type: 'ephemeral' } }]);
   assert.deepEqual(body.tool_choice, { type: 'auto' });
   assert.equal(body.temperature, undefined);
 });

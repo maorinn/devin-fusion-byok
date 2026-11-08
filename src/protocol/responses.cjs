@@ -5,6 +5,7 @@ const { frame } = require('./wire.cjs');
 const { textChunk, thinkingChunk, toolChunk, stopChunk, usageChunk } = require('./chat.cjs');
 const { createTracker } = require('../runtime/monitor.cjs');
 const { isAnthropicFormat, anthropicHeaders, buildAnthropicBody, createAnthropicAdapter } = require('./anthropic.cjs');
+const { replayScope, replayReader, anthropicCapture, responsesCapture, defaultStore } = require('./reasoning-replay.cjs');
 const MAX_SSE_BUFFER = 64 * 1024 * 1024;
 
 function isChatFormat(format = '') { return /chat[-_\/]?completions|^(?:chat|openai)$/.test(format); }
@@ -32,9 +33,26 @@ function contentOf(message, chat) {
   return parts;
 }
 
-function buildRequestBody(request, route, provider) {
-  if (isAnthropicFormat(provider.apiFormat)) return buildAnthropicBody(request, route, provider);
+function wantsReasoningReplay(route, provider, chat, options = {}) {
+  const scope = options.scope ?? replayScope(provider, route);
+  return !chat && provider.replayReasoning !== false && Boolean(route.effort) && route.effort !== 'none'
+    && !options.replay?.isDisabled?.(scope);
+}
+
+// True when a request carries state that only reasoning replay added, so an
+// HTTP 400 may be caused by it and is worth one retry without it.
+function usesReplayState(body) {
+  if (body.include) return true;
+  if (body.input?.some(entry => entry.type === 'reasoning')) return true;
+  return Boolean(body.messages?.some(message => Array.isArray(message.content)
+    && message.content.some(block => block.type === 'thinking' || block.type === 'redacted_thinking')));
+}
+
+function buildRequestBody(request, route, provider, options = {}) {
+  if (isAnthropicFormat(provider.apiFormat)) return buildAnthropicBody(request, route, provider, options);
   const chat = isChatFormat(provider.apiFormat);
+  const scope = options.scope ?? replayScope(provider, route);
+  const replayed = replayReader(wantsReasoningReplay(route, provider, chat, options) ? options.replay : undefined, scope);
   const messages = [];
   if (request.systemPrompt !== '') messages.push({ role: chat ? 'system' : 'developer', content: request.systemPrompt });
   for (const message of request.messages) {
@@ -50,6 +68,7 @@ function buildRequestBody(request, route, provider) {
     } else {
       // A native message stores text before its repeated tool calls. Preserve
       // that sequence and keep every system message at its original position.
+      messages.push(...replayed(message.toolCalls?.map(tool => tool.id)));
       if (content !== '' || !message.toolCalls?.length) messages.push({ role: message.role === 'system' ? 'developer' : message.role, content });
       for (const tool of message.toolCalls || []) messages.push({ type: 'function_call', call_id: tool.id, name: tool.name, arguments: tool.arguments });
     }
@@ -61,6 +80,12 @@ function buildRequestBody(request, route, provider) {
   if (route.effort) {
     if (chat) body.reasoning_effort = route.effort;
     else body.reasoning = { effort: route.effort, ...(route.effort === 'none' ? {} : { summary: 'auto' }) };
+  }
+  if (wantsReasoningReplay(route, provider, chat, options)) {
+    // Stateless reasoning: the provider returns encrypted reasoning that we
+    // hand back on the next tool turn instead of relying on server storage.
+    body.include = ['reasoning.encrypted_content'];
+    body.store = false;
   }
   if (request.tools?.length) {
     body.tools = request.tools.map(tool => chat ? { type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } } : { type: 'function', name: tool.name, description: tool.description, parameters: tool.parameters });
@@ -268,7 +293,7 @@ function processor(id, uid, chat, emit) {
   };
 }
 
-async function serveChat({ request, route, provider, res, signal, log = () => {}, timeouts = {}, onMetrics = () => {} }) {
+async function serveChat({ request, route, provider, res, signal, log = () => {}, timeouts = {}, onMetrics = () => {}, replay = defaultStore }) {
   const id = randomUUID();
   const metrics = createTracker({ id, request, route, provider });
   let outcome = 'error', outcomeCode = null;
@@ -309,10 +334,10 @@ async function serveChat({ request, route, provider, res, signal, log = () => {}
 
   try {
     const { url, chat, anthropic } = endpoint(provider);
-    const body = buildRequestBody(request, route, provider);
-
-    armTimer(firstResponseLimit, 'upstream_timeout');
-    const upstream = await fetch(url, {
+    const scope = replayScope(provider, route);
+    const capture = !replay || !scope || provider.replayReasoning === false || chat && !anthropic ? null
+      : anthropic ? anthropicCapture() : responsesCapture();
+    const send = body => fetch(url, {
       redirect: 'error',
       method: 'POST',
       headers: {
@@ -323,6 +348,19 @@ async function serveChat({ request, route, provider, res, signal, log = () => {}
       body: JSON.stringify(body),
       signal: upstreamController.signal
     });
+
+    armTimer(firstResponseLimit, 'upstream_timeout');
+    let body = buildRequestBody(request, route, provider, { replay, scope });
+    let upstream = await send(body);
+    if (upstream.status === 400 && replay && usesReplayState(body)) {
+      // Some gateways reject encrypted reasoning, thinking blocks or the
+      // include/store fields. Drop replay for this provider + model and retry once.
+      await upstream.body?.cancel();
+      replay.disable(scope);
+      record({ event: 'replay-disabled', model: route.model, status: 400 });
+      body = buildRequestBody(request, route, provider, { replay, scope });
+      upstream = await send(body);
+    }
     clearTimer();
 
     status = upstream.status;
@@ -364,6 +402,7 @@ async function serveChat({ request, route, provider, res, signal, log = () => {}
     try {
       const adapt = anthropic ? createAnthropicAdapter() : event => [event];
       upstream: for await (const raw of events(rawChunksWithTimeout(upstream.body))) {
+        capture?.observe(raw);
         for (const event of adapt(raw)) {
           metrics.event(event, chat);
           await stream.event(event);
@@ -390,6 +429,10 @@ async function serveChat({ request, route, provider, res, signal, log = () => {}
       throw err;
     }
 
+    if (capture) {
+      const { toolIds, items } = capture.result();
+      try { replay.save(scope, toolIds, items); } catch { /* Replay is best effort. */ }
+    }
     res.end(frame(Buffer.from('{}'), 2));
     outcome = 'success';
     record({ event: 'chat-complete', model: route.model, status, toolNames, requestId: id });
